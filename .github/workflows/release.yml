@@ -33,8 +33,8 @@ jobs:
           # Dynamically extract the package name from Cargo.toml
           PROJECT_NAME=$(grep -m 1 '^name = ' Cargo.toml | cut -d '"' -f 2)
 
-          # Setup paths
-          BINARY_NAME="${PROJECT_NAME}${matrix.binary_extension}"
+          # Setup paths (Fixed GitHub expression syntax here)
+          BINARY_NAME="${PROJECT_NAME}${{ matrix.binary_extension }}"
           TARGET_PATH="target/release/${BINARY_NAME}"
           OUTPUT_PATH="./${BINARY_NAME}"
 
