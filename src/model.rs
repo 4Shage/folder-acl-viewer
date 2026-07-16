@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 
 pub const COLUMNS: [&str; 6] = [
     "Folder",
@@ -52,26 +51,6 @@ pub fn split_folder(path: &str) -> (String, String) {
         }
     }
     (path.to_string(), String::new())
-}
-
-pub fn unique_folders(records: &[Record]) -> Vec<String> {
-    let mut set = BTreeSet::new();
-    for r in records {
-        if !r.folder.is_empty() {
-            set.insert(r.folder.clone());
-        }
-    }
-    set.into_iter().collect()
-}
-
-pub fn unique_identities(records: &[Record]) -> Vec<String> {
-    let mut set = BTreeSet::new();
-    for r in records {
-        if !r.identity.is_empty() {
-            set.insert(r.identity.clone());
-        }
-    }
-    set.into_iter().collect()
 }
 
 /// A node in a folder tree. `entries` holds indices into the record list

@@ -14,28 +14,30 @@ pub fn apply_style(ctx: &egui::Context) {
     visuals.widgets.active.bg_fill = egui::Color32::from_rgb(66, 133, 199);
     visuals.selection.bg_fill = egui::Color32::from_rgb(59, 110, 168);
     visuals.selection.stroke.color = egui::Color32::WHITE;
-    visuals.window_rounding = egui::Rounding::same(8.0);
-    visuals.menu_rounding = egui::Rounding::same(6.0);
-    visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
-    visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
-    visuals.widgets.active.rounding = egui::Rounding::same(6.0);
-    visuals.widgets.noninteractive.rounding = egui::Rounding::same(6.0);
+    visuals.window_corner_radius = egui::CornerRadius::same(8);
+    visuals.menu_corner_radius = egui::CornerRadius::same(6);
+    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(6);
+    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(6);
+    visuals.widgets.active.corner_radius = egui::CornerRadius::same(6);
+    visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(6);
     ctx.set_visuals(visuals);
 
-    let mut style = (*ctx.style()).clone();
-    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.button_padding = egui::vec2(10.0, 6.0);
-    style.spacing.window_margin = egui::Margin::same(10.0);
-    style.spacing.indent = 18.0;
-    for (text_style, font_id) in style.text_styles.iter_mut() {
-        match text_style {
-            egui::TextStyle::Heading => font_id.size = 20.0,
-            egui::TextStyle::Body => font_id.size = 14.5,
-            egui::TextStyle::Button => font_id.size = 14.5,
-            egui::TextStyle::Small => font_id.size = 12.0,
-            egui::TextStyle::Monospace => font_id.size = 13.5,
-            _ => {}
+    // Mutate both light/dark styles so the look is consistent regardless of
+    // OS theme.
+    ctx.all_styles_mut(|style| {
+        style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+        style.spacing.button_padding = egui::vec2(10.0, 6.0);
+        style.spacing.window_margin = egui::Margin::same(10);
+        style.spacing.indent = 18.0;
+        for (text_style, font_id) in style.text_styles.iter_mut() {
+            match text_style {
+                egui::TextStyle::Heading => font_id.size = 20.0,
+                egui::TextStyle::Body => font_id.size = 14.5,
+                egui::TextStyle::Button => font_id.size = 14.5,
+                egui::TextStyle::Small => font_id.size = 12.0,
+                egui::TextStyle::Monospace => font_id.size = 13.5,
+                _ => {}
+            }
         }
-    }
-    ctx.set_style(style);
+    });
 }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
@@ -5,10 +6,8 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 use tokio::runtime::Handle;
 
-use crate::loader;
-use crate::model::{
-    COLUMNS, Record, TreeNode, build_other_tree, build_path_tree, unique_folders, unique_identities,
-};
+use crate::loader::{self, LoadedData};
+use crate::model::{COLUMNS, Record, TreeNode, build_other_tree, build_path_tree};
 
 #[derive(PartialEq, Clone, Copy)]
 enum SearchBy {
@@ -18,28 +17,33 @@ enum SearchBy {
 
 enum Selection {
     None,
-    Folder(String),
-    User(String),
+    Folder { name: String, tree: TreeNode },
+    User { name: String, tree: TreeNode },
 }
 
 pub struct FolderAclApp {
     records: Vec<Record>,
+    folder_index: HashMap<String, Vec<usize>>,
+    identity_index: HashMap<String, Vec<usize>>,
+    unique_folders: Vec<String>,
+    unique_identities: Vec<String>,
+
     filtered_table: Vec<usize>,
+    table_sort_col: usize,
+    table_sort_desc: bool,
 
     search_by: SearchBy,
     sidebar_query: String,
+    sidebar_cache: Vec<String>,
     selection: Selection,
-
-    table_sort_col: usize,
-    table_sort_desc: bool,
 
     loaded_path: Option<String>,
     error: Option<String>,
     loading: bool,
 
     rt: Handle,
-    result_tx: Sender<Result<(PathBuf, Vec<Record>), String>>,
-    result_rx: Receiver<Result<(PathBuf, Vec<Record>), String>>,
+    result_tx: Sender<Result<(PathBuf, LoadedData), String>>,
+    result_rx: Receiver<Result<(PathBuf, LoadedData), String>>,
 }
 
 impl FolderAclApp {
@@ -47,12 +51,17 @@ impl FolderAclApp {
         let (result_tx, result_rx) = channel();
         Self {
             records: Vec::new(),
+            folder_index: HashMap::new(),
+            identity_index: HashMap::new(),
+            unique_folders: Vec::new(),
+            unique_identities: Vec::new(),
             filtered_table: Vec::new(),
-            search_by: SearchBy::Folder,
-            sidebar_query: String::new(),
-            selection: Selection::None,
             table_sort_col: 0,
             table_sort_desc: false,
+            search_by: SearchBy::Folder,
+            sidebar_query: String::new(),
+            sidebar_cache: Vec::new(),
+            selection: Selection::None,
             loaded_path: None,
             error: None,
             loading: false,
@@ -68,76 +77,82 @@ impl FolderAclApp {
         let tx = self.result_tx.clone();
         self.rt.spawn(async move {
             let res = loader::load_records(path.clone()).await;
-            let _ = tx.send(res.map(|records| (path, records)));
+            let _ = tx.send(res.map(|data| (path, data)));
         });
     }
 
-    fn on_loaded(&mut self, path: PathBuf, records: Vec<Record>) {
-        self.records = records;
+    fn on_loaded(&mut self, path: PathBuf, data: LoadedData) {
+        self.records = data.records;
+        self.folder_index = data.folder_index;
+        self.identity_index = data.identity_index;
+        self.unique_folders = data.unique_folders;
+        self.unique_identities = data.unique_identities;
+
         self.loaded_path = Some(path.display().to_string());
         self.selection = Selection::None;
-        self.apply_table_sort();
-    }
-
-    fn apply_table_sort(&mut self) {
+        self.table_sort_col = 0;
+        self.table_sort_desc = false;
         self.filtered_table = (0..self.records.len()).collect();
-        let col = self.table_sort_col;
-        let desc = self.table_sort_desc;
-        let records = &self.records;
-        self.filtered_table.sort_by(|&a, &b| {
-            let ord = records[a].field(col).cmp(records[b].field(col));
-            if desc { ord.reverse() } else { ord }
-        });
+        self.refresh_sidebar_cache();
     }
 
-    fn set_table_sort(&mut self, col: usize) {
-        if self.table_sort_col == col {
-            self.table_sort_desc = !self.table_sort_desc;
-        } else {
-            self.table_sort_col = col;
-            self.table_sort_desc = false;
-        }
-        self.apply_table_sort();
-    }
-
-    fn sidebar_items(&self) -> Vec<String> {
-        let all = match self.search_by {
-            SearchBy::Folder => unique_folders(&self.records),
-            SearchBy::User => unique_identities(&self.records),
+    fn refresh_sidebar_cache(&mut self) {
+        let source = match self.search_by {
+            SearchBy::Folder => &self.unique_folders,
+            SearchBy::User => &self.unique_identities,
         };
-        if self.sidebar_query.is_empty() {
-            all
+        self.sidebar_cache = if self.sidebar_query.is_empty() {
+            source.clone()
         } else {
             let q = self.sidebar_query.to_lowercase();
-            all.into_iter()
+            source
+                .iter()
                 .filter(|v| v.to_lowercase().contains(&q))
+                .cloned()
                 .collect()
+        };
+    }
+
+    /// Looks up the pre-built index (O(1)) instead of scanning all records,
+    /// so selecting a folder/user stays instant even at millions of rows.
+    fn select(&mut self, name: String) {
+        match self.search_by {
+            SearchBy::Folder => {
+                let indices = self.folder_index.get(&name).cloned().unwrap_or_default();
+                let tree = build_other_tree(&self.records, &indices);
+                self.selection = Selection::Folder { name, tree };
+            }
+            SearchBy::User => {
+                let indices = self.identity_index.get(&name).cloned().unwrap_or_default();
+                let tree = build_path_tree(&self.records, &indices);
+                self.selection = Selection::User { name, tree };
+            }
         }
     }
 }
 
 impl eframe::App for FolderAclApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         while let Ok(result) = self.result_rx.try_recv() {
             self.loading = false;
             match result {
-                Ok((path, records)) => self.on_loaded(path, records),
+                Ok((path, data)) => self.on_loaded(path, data),
                 Err(e) => self.error = Some(e),
             }
         }
         if self.loading {
-            ctx.request_repaint();
+            ui.ctx().request_repaint();
         }
 
-        self.top_panel(ctx);
-        self.sidebar_panel(ctx);
-        self.central_panel(ctx);
+        self.top_panel(ui);
+        self.sidebar_panel(ui);
+        self.central_panel(ui);
     }
 }
 
 impl FolderAclApp {
-    fn top_panel(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+    fn top_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.heading("📁 Folder ACL Viewer");
@@ -169,11 +184,11 @@ impl FolderAclApp {
         });
     }
 
-    fn sidebar_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("sidebar")
+    fn sidebar_panel(&mut self, ui: &mut egui::Ui) {
+        egui::Panel::left("sidebar")
             .resizable(true)
-            .default_width(270.0)
-            .show(ctx, |ui| {
+            .default_size(270.0)
+            .show(ui, |ui| {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui
@@ -183,6 +198,7 @@ impl FolderAclApp {
                     {
                         self.search_by = SearchBy::Folder;
                         self.sidebar_query.clear();
+                        self.refresh_sidebar_cache();
                     }
                     if ui
                         .selectable_label(self.search_by == SearchBy::User, "👤 Users")
@@ -191,10 +207,11 @@ impl FolderAclApp {
                     {
                         self.search_by = SearchBy::User;
                         self.sidebar_query.clear();
+                        self.refresh_sidebar_cache();
                     }
                 });
                 ui.add_space(4.0);
-                ui.add(
+                let edit = ui.add(
                     egui::TextEdit::singleline(&mut self.sidebar_query)
                         .hint_text(match self.search_by {
                             SearchBy::Folder => "🔍 Search folders...",
@@ -202,43 +219,50 @@ impl FolderAclApp {
                         })
                         .desired_width(f32::INFINITY),
                 );
-                ui.add_space(6.0);
+                if edit.changed() {
+                    self.refresh_sidebar_cache();
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(format!("{} matches", self.sidebar_cache.len())).weak(),
+                );
+                ui.add_space(2.0);
                 ui.separator();
 
-                let items = self.sidebar_items();
+                let icon = match self.search_by {
+                    SearchBy::Folder => "📁",
+                    SearchBy::User => "👤",
+                };
+                let mut clicked_item: Option<String> = None;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for item in items {
+                        for item in &self.sidebar_cache {
                             let selected = match &self.selection {
-                                Selection::Folder(f) => {
-                                    self.search_by == SearchBy::Folder && f == &item
+                                Selection::Folder { name, .. } => {
+                                    self.search_by == SearchBy::Folder && name == item
                                 }
-                                Selection::User(u) => {
-                                    self.search_by == SearchBy::User && u == &item
+                                Selection::User { name, .. } => {
+                                    self.search_by == SearchBy::User && name == item
                                 }
                                 Selection::None => false,
-                            };
-                            let icon = match self.search_by {
-                                SearchBy::Folder => "📁",
-                                SearchBy::User => "👤",
                             };
                             if ui
                                 .selectable_label(selected, format!("{icon} {item}"))
                                 .clicked()
                             {
-                                self.selection = match self.search_by {
-                                    SearchBy::Folder => Selection::Folder(item.clone()),
-                                    SearchBy::User => Selection::User(item.clone()),
-                                };
+                                clicked_item = Some(item.clone());
                             }
                         }
                     });
+                if let Some(item) = clicked_item {
+                    self.select(item);
+                }
             });
     }
 
-    fn central_panel(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
+    fn central_panel(&mut self, ui: &mut egui::Ui) {
+        egui::CentralPanel::default().show(ui, |ui| {
             if self.records.is_empty() {
                 ui.centered_and_justified(|ui| {
                     ui.label("Open a pipe-delimited CSV (Folder|Identity|Rights|AccessControl|Inherited) to begin.");
@@ -246,138 +270,129 @@ impl FolderAclApp {
                 return;
             }
 
+            let mut clear_selection = false;
+
             match &self.selection {
-                Selection::None => self.draw_table(ui),
-                Selection::Folder(folder) => {
-                    let folder = folder.clone();
-                    self.draw_folder_tree(ui, &folder);
+                Selection::None => {
+                    draw_table(
+                        ui,
+                        &self.records,
+                        &mut self.filtered_table,
+                        &mut self.table_sort_col,
+                        &mut self.table_sort_desc,
+                    );
                 }
-                Selection::User(user) => {
-                    let user = user.clone();
-                    self.draw_user_tree(ui, &user);
+                Selection::Folder { name, tree } => {
+                    draw_tree_view(ui, &self.records, "📁", name, tree, false, &mut clear_selection);
                 }
+                Selection::User { name, tree } => {
+                    draw_tree_view(ui, &self.records, "👤", name, tree, true, &mut clear_selection);
+                }
+            }
+
+            if clear_selection {
+                self.selection = Selection::None;
             }
         });
     }
+}
 
-    fn draw_table(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            egui::RichText::new(
-                "All records — pick a folder or user on the left for a permissions tree.",
-            )
-            .weak(),
-        );
-        ui.add_space(4.0);
-        let mut sort_clicked = None;
+fn draw_table(
+    ui: &mut egui::Ui,
+    records: &[Record],
+    filtered: &mut Vec<usize>,
+    sort_col: &mut usize,
+    sort_desc: &mut bool,
+) {
+    ui.label(
+        egui::RichText::new(
+            "All records — pick a folder or user on the left for a permissions tree.",
+        )
+        .weak(),
+    );
+    ui.add_space(4.0);
+    let mut sort_clicked = None;
 
-        TableBuilder::new(ui)
-            .id_salt("full_table")
-            .striped(true)
-            .resizable(true)
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .columns(Column::auto().resizable(true).at_least(80.0), COLUMNS.len())
-            .header(26.0, |mut header| {
-                for (i, name) in COLUMNS.iter().enumerate() {
-                    header.col(|ui| {
-                        let label = if i == self.table_sort_col {
-                            format!("{name} {}", if self.table_sort_desc { "▼" } else { "▲" })
-                        } else {
-                            name.to_string()
-                        };
-                        if ui.button(label).clicked() {
-                            sort_clicked = Some(i);
-                        }
-                    });
-                }
-            })
-            .body(|body| {
-                let filtered = &self.filtered_table;
-                let records = &self.records;
-                body.rows(22.0, filtered.len(), |mut row| {
-                    let idx = filtered[row.index()];
-                    let r = &records[idx];
-                    for col in 0..COLUMNS.len() {
-                        row.col(|ui| {
-                            ui.label(r.field(col));
-                        });
+    TableBuilder::new(ui)
+        .id_salt("full_table")
+        .striped(true)
+        .resizable(true)
+        .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+        .columns(Column::auto().resizable(true).at_least(80.0), COLUMNS.len())
+        .header(26.0, |mut header| {
+            for (i, name) in COLUMNS.iter().enumerate() {
+                header.col(|ui| {
+                    let label = if i == *sort_col {
+                        format!("{name} {}", if *sort_desc { "▼" } else { "▲" })
+                    } else {
+                        name.to_string()
+                    };
+                    if ui.button(label).clicked() {
+                        sort_clicked = Some(i);
                     }
                 });
+            }
+        })
+        .body(|body| {
+            body.rows(22.0, filtered.len(), |mut row| {
+                let idx = filtered[row.index()];
+                let r = &records[idx];
+                for col in 0..COLUMNS.len() {
+                    row.col(|ui| {
+                        ui.label(r.field(col));
+                    });
+                }
             });
+        });
 
-        if let Some(col) = sort_clicked {
-            self.set_table_sort(col);
+    if let Some(col) = sort_clicked {
+        if *sort_col == col {
+            *sort_desc = !*sort_desc;
+        } else {
+            *sort_col = col;
+            *sort_desc = false;
         }
+        let (sc, sd) = (*sort_col, *sort_desc);
+        filtered.sort_by(|&a, &b| {
+            let ord = records[a].field(sc).cmp(records[b].field(sc));
+            if sd { ord.reverse() } else { ord }
+        });
     }
+}
 
-    fn draw_folder_tree(&mut self, ui: &mut egui::Ui, folder: &str) {
-        ui.horizontal(|ui| {
-            ui.heading(format!("📁 {folder}"));
-            if ui.button("✕ Clear").clicked() {
-                self.selection = Selection::None;
+fn draw_tree_view(
+    ui: &mut egui::Ui,
+    records: &[Record],
+    icon: &str,
+    name: &str,
+    tree: &TreeNode,
+    show_identity: bool,
+    clear_selection: &mut bool,
+) {
+    ui.horizontal(|ui| {
+        ui.heading(format!("{icon} {name}"));
+        if ui.button("✕ Clear").clicked() {
+            *clear_selection = true;
+        }
+    });
+    ui.add_space(4.0);
+
+    egui::ScrollArea::vertical()
+        .id_salt(format!("tree-{icon}-{name}"))
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            render_entries(ui, records, &tree.entries, show_identity);
+            for (child_name, child) in &tree.children {
+                render_node(
+                    ui,
+                    records,
+                    child_name,
+                    child,
+                    show_identity,
+                    &format!("{icon}{name}"),
+                );
             }
         });
-        ui.add_space(4.0);
-
-        let indices: Vec<usize> = self
-            .records
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.folder == folder)
-            .map(|(i, _)| i)
-            .collect();
-        let tree = build_other_tree(&self.records, &indices);
-
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                render_entries(ui, &self.records, &tree.entries, false);
-                for (name, child) in &tree.children {
-                    render_node(
-                        ui,
-                        &self.records,
-                        name,
-                        child,
-                        false,
-                        &format!("folder-{folder}"),
-                    );
-                }
-            });
-    }
-
-    fn draw_user_tree(&mut self, ui: &mut egui::Ui, user: &str) {
-        ui.horizontal(|ui| {
-            ui.heading(format!("👤 {user}"));
-            if ui.button("✕ Clear").clicked() {
-                self.selection = Selection::None;
-            }
-        });
-        ui.add_space(4.0);
-
-        let indices: Vec<usize> = self
-            .records
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| r.identity == user)
-            .map(|(i, _)| i)
-            .collect();
-        let tree = build_path_tree(&self.records, &indices);
-
-        egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                render_entries(ui, &self.records, &tree.entries, true);
-                for (name, child) in &tree.children {
-                    render_node(
-                        ui,
-                        &self.records,
-                        name,
-                        child,
-                        true,
-                        &format!("user-{user}"),
-                    );
-                }
-            });
-    }
 }
 
 fn render_node(

@@ -1,13 +1,13 @@
 [package]
 name = "folder-acl-viewer"
 author = "Paweł Harasymowicz <contact@gmshage.com>"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
-eframe = "0.29"
-egui = "0.29"
-egui_extras = "0.29"
-csv = "1.3"
-rfd = "0.15"
-tokio = { version = "1", features = ["rt-multi-thread", "fs", "macros"] }
+csv = "1.4.0"
+eframe = "0.35.0"
+egui = "0.35.0"
+egui_extras = "0.35.0"
+rfd = "0.17.2"
+tokio = { version="1.52.4",features = ["rt-multi-thread", "fs", "macros"] }

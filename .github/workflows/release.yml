@@ -1,0 +1,95 @@
+name: Manual Release Build
+
+on:
+  workflow_dispatch: # Enables the "Run workflow" button in GitHub Actions
+
+jobs:
+  build:
+    name: Build for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: linux-binary
+            binary_extension: ""
+          - os: windows-latest
+            artifact_name: windows-binary
+            binary_extension: ".exe"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Release Binaries
+        run: cargo build --release
+
+      - name: Parse Binary Name and Package Artifact
+        shell: bash
+        run: |
+          # Dynamically extract the package name from Cargo.toml
+          PROJECT_NAME=$(grep -m 1 '^name = ' Cargo.toml | cut -d '"' -f 2)
+
+          # Setup paths
+          BINARY_NAME="${PROJECT_NAME}${matrix.binary_extension}"
+          TARGET_PATH="target/release/${BINARY_NAME}"
+          OUTPUT_PATH="./${BINARY_NAME}"
+
+          # Copy binary to root for easier artifact uploading
+          cp "$TARGET_PATH" "$OUTPUT_PATH"
+          echo "BINARY_PATH=$OUTPUT_PATH" >> $GITHUB_ENV
+
+      - name: Upload Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ env.BINARY_PATH }}
+
+  create-release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required permission to create tags and releases
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Extract Version from Cargo.toml
+        id: get_version
+        run: |
+          # Dynamically extract the version string
+          VERSION=$(grep -m 1 '^version = ' Cargo.toml | cut -d '"' -f 2)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Download Linux Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-binary
+          path: ./artifacts
+
+      - name: Download Windows Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-binary
+          path: ./artifacts
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: Release v${{ env.VERSION }}
+          body: |
+            Automated release for version ${{ env.VERSION }}.
+
+            ### Assets Included:
+            * Linux Binary
+            * Windows Binary (`.exe`)
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/*
