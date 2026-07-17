@@ -75,6 +75,20 @@ fn parse_and_index(content: &[u8]) -> Result<LoadedData, String> {
         let row = result.map_err(|e| format!("CSV parse error: {e}"))?;
         let raw_folder = row.get(0).unwrap_or("").trim();
         let identity = interner.intern(row.get(1).unwrap_or("").trim());
+        if vec! [
+
+            "BUILTIN\\Administrators",
+
+            "CREATOR OWNER",
+
+            "NT AUTHORITY\\SYSTEM",
+
+            .contains(&&*identity)
+
+            {
+            continue;
+            }
+        ]
         let rights = interner.intern(row.get(2).unwrap_or("").trim());
         let access_control = interner.intern(row.get(3).unwrap_or("").trim());
         let inherited = interner.intern(row.get(4).unwrap_or("").trim());
