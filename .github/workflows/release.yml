@@ -35,6 +35,13 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+      
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          cache-all-crates: true
+          cache-on-failure: true
 
       - name: Build Release Binaries
         run: cargo build --release
