@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub const COLUMNS: [&str; 6] = [
     "Folder",
@@ -9,14 +10,21 @@ pub const COLUMNS: [&str; 6] = [
     "Inherited",
 ];
 
+/// Interned string: cheap to clone (refcount bump, no allocation or copy)
+/// and much smaller in memory than storing the same text over and over.
+/// ACL exports are extremely repetitive — a handful of Rights/AccessControl
+/// values and a folder path repeated once per grantee — so interning is a
+/// large win on both memory and clone cost for multi-million-row files.
+pub type IStr = Arc<str>;
+
 #[derive(Clone)]
 pub struct Record {
-    pub folder: String,
-    pub other: String,
-    pub identity: String,
-    pub rights: String,
-    pub access_control: String,
-    pub inherited: String,
+    pub folder: IStr,
+    pub other: IStr,
+    pub identity: IStr,
+    pub rights: IStr,
+    pub access_control: IStr,
+    pub inherited: IStr,
 }
 
 impl Record {
@@ -40,17 +48,20 @@ impl Record {
 /// including the 4th `\` becomes `folder`, the remainder becomes `other`.
 /// If there are fewer than 4 backslashes, `folder` is the whole string
 /// and `other` is empty.
-pub fn split_folder(path: &str) -> (String, String) {
+///
+/// Borrows from `path` instead of allocating, so the caller can decide
+/// whether/how to intern the pieces.
+pub fn split_folder(path: &str) -> (&str, &str) {
     let mut count = 0;
     for (i, c) in path.char_indices() {
         if c == '\\' {
             count += 1;
             if count == 4 {
-                return (path[..=i].to_string(), path[i + 1..].to_string());
+                return (&path[..=i], &path[i + 1..]);
             }
         }
     }
-    (path.to_string(), String::new())
+    (path, "")
 }
 
 /// A node in a folder tree. `entries` holds indices into the record list
@@ -96,4 +107,93 @@ pub fn build_other_tree(records: &[Record], indices: &[usize]) -> TreeNode {
         root.insert(&segments, idx);
     }
     root
+}
+
+/// Tracks which folder nodes differ from the tree's default open/closed
+/// state. Only exceptions are stored, so switching a whole (possibly huge)
+/// tree between "all expanded" and "all collapsed" is O(1) instead of
+/// having to touch every node.
+#[derive(Default)]
+pub struct ExpansionState {
+    pub default_open: bool,
+    toggled: std::collections::HashSet<String>,
+}
+
+impl ExpansionState {
+    pub fn new(default_open: bool) -> Self {
+        Self {
+            default_open,
+            toggled: std::collections::HashSet::new(),
+        }
+    }
+
+    pub fn is_open(&self, id: &str) -> bool {
+        self.default_open != self.toggled.contains(id)
+    }
+
+    pub fn toggle(&mut self, id: String) {
+        if !self.toggled.remove(&id) {
+            self.toggled.insert(id);
+        }
+    }
+}
+
+/// One row of a flattened tree, ready for virtualized rendering (only the
+/// rows actually visible in the scroll viewport need to be turned into
+/// widgets each frame — see `ScrollArea::show_rows` in app.rs).
+pub enum FlatRow {
+    Folder {
+        id: String,
+        name: String,
+        depth: usize,
+        expanded: bool,
+        has_children: bool,
+    },
+    Entry {
+        record_idx: usize,
+        depth: usize,
+    },
+}
+
+/// Flattens a `TreeNode` into a linear list of rows, honoring `expansion`.
+/// Collapsed subtrees are skipped entirely, so this is proportional to the
+/// number of *visible* (open) nodes, not the whole tree.
+pub fn flatten_tree(tree: &TreeNode, expansion: &ExpansionState) -> Vec<FlatRow> {
+    let mut out = Vec::new();
+    flatten_node(tree, "", 0, expansion, &mut out);
+    out
+}
+
+fn flatten_node(
+    node: &TreeNode,
+    id_prefix: &str,
+    depth: usize,
+    expansion: &ExpansionState,
+    out: &mut Vec<FlatRow>,
+) {
+    for &idx in &node.entries {
+        out.push(FlatRow::Entry {
+            record_idx: idx,
+            depth,
+        });
+    }
+    for (name, child) in &node.children {
+        let id = if id_prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{id_prefix}/{name}")
+        };
+        let expanded = expansion.is_open(&id);
+        let has_children = !child.children.is_empty() || !child.entries.is_empty();
+        out.push(FlatRow::Folder {
+            id: id.clone(),
+            name: name.clone(),
+            depth,
+            expanded,
+            has_children,
+        });
+        if expanded {
+            flatten_node(child, &id, depth + 1, expansion, out);
+        }
+    }
 }

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use eframe::egui;
@@ -7,26 +8,54 @@ use egui_extras::{Column, TableBuilder};
 use tokio::runtime::Handle;
 
 use crate::loader::{self, LoadedData};
-use crate::model::{COLUMNS, Record, TreeNode, build_other_tree, build_path_tree};
+use crate::model::{
+    COLUMNS, ExpansionState, FlatRow, Record, TreeNode, build_other_tree, build_path_tree,
+    flatten_tree,
+};
 
 #[derive(PartialEq, Clone, Copy)]
 enum SearchBy {
     Folder,
     User,
+    Other,
 }
 
 enum Selection {
     None,
-    Folder { name: String, tree: TreeNode },
-    User { name: String, tree: TreeNode },
+    Folder {
+        name: String,
+        tree: TreeNode,
+        expansion: ExpansionState,
+        flat: Vec<FlatRow>,
+    },
+    User {
+        name: String,
+        tree: TreeNode,
+        expansion: ExpansionState,
+        flat: Vec<FlatRow>,
+    },
+    Other {
+        name: String,
+        tree: TreeNode,
+        expansion: ExpansionState,
+        flat: Vec<FlatRow>,
+    },
 }
 
 pub struct FolderAclApp {
     records: Vec<Record>,
-    folder_index: HashMap<String, Vec<usize>>,
-    identity_index: HashMap<String, Vec<usize>>,
+    folder_index: HashMap<Arc<str>, Vec<usize>>,
+    identity_index: HashMap<Arc<str>, Vec<usize>>,
+    other_index: HashMap<Arc<str>, Vec<usize>>,
     unique_folders: Vec<String>,
     unique_identities: Vec<String>,
+    unique_others: Vec<String>,
+    // Lower-cased mirrors of the three lists above, built once at load time
+    // so filtering on every keystroke doesn't re-lowercase (and
+    // re-allocate) every name each time.
+    unique_folders_lower: Vec<String>,
+    unique_identities_lower: Vec<String>,
+    unique_others_lower: Vec<String>,
 
     filtered_table: Vec<usize>,
     table_sort_col: usize,
@@ -34,7 +63,10 @@ pub struct FolderAclApp {
 
     search_by: SearchBy,
     sidebar_query: String,
-    sidebar_cache: Vec<String>,
+    // Indices into unique_folders / unique_identities (depending on
+    // search_by) matching the current query — avoids cloning the whole
+    // name list into a fresh Vec<String> on every keystroke.
+    sidebar_cache: Vec<usize>,
     selection: Selection,
 
     loaded_path: Option<String>,
@@ -53,8 +85,13 @@ impl FolderAclApp {
             records: Vec::new(),
             folder_index: HashMap::new(),
             identity_index: HashMap::new(),
+            other_index: HashMap::new(),
             unique_folders: Vec::new(),
             unique_identities: Vec::new(),
+            unique_others: Vec::new(),
+            unique_folders_lower: Vec::new(),
+            unique_identities_lower: Vec::new(),
+            unique_others_lower: Vec::new(),
             filtered_table: Vec::new(),
             table_sort_col: 0,
             table_sort_desc: false,
@@ -85,8 +122,25 @@ impl FolderAclApp {
         self.records = data.records;
         self.folder_index = data.folder_index;
         self.identity_index = data.identity_index;
+        self.other_index = data.other_index;
+        self.unique_folders_lower = data
+            .unique_folders
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
+        self.unique_identities_lower = data
+            .unique_identities
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
+        self.unique_others_lower = data
+            .unique_others
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
         self.unique_folders = data.unique_folders;
         self.unique_identities = data.unique_identities;
+        self.unique_others = data.unique_others;
 
         self.loaded_path = Some(path.display().to_string());
         self.selection = Selection::None;
@@ -97,35 +151,83 @@ impl FolderAclApp {
     }
 
     fn refresh_sidebar_cache(&mut self) {
-        let source = match self.search_by {
-            SearchBy::Folder => &self.unique_folders,
-            SearchBy::User => &self.unique_identities,
+        let lower = match self.search_by {
+            SearchBy::Folder => &self.unique_folders_lower,
+            SearchBy::User => &self.unique_identities_lower,
+            SearchBy::Other => &self.unique_others_lower,
         };
         self.sidebar_cache = if self.sidebar_query.is_empty() {
-            source.clone()
+            (0..lower.len()).collect()
         } else {
             let q = self.sidebar_query.to_lowercase();
-            source
-                .iter()
-                .filter(|v| v.to_lowercase().contains(&q))
-                .cloned()
+            (0..lower.len())
+                .filter(|&i| lower[i].contains(&q))
                 .collect()
         };
     }
 
     /// Looks up the pre-built index (O(1)) instead of scanning all records,
     /// so selecting a folder/user stays instant even at millions of rows.
-    fn select(&mut self, name: String) {
+    fn select_index(&mut self, idx: usize) {
         match self.search_by {
             SearchBy::Folder => {
-                let indices = self.folder_index.get(&name).cloned().unwrap_or_default();
-                let tree = build_other_tree(&self.records, &indices);
-                self.selection = Selection::Folder { name, tree };
+                let name = self.unique_folders[idx].clone();
+                let indices = self
+                    .folder_index
+                    .get(name.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let tree = build_other_tree(&self.records, indices);
+                // Folder view starts collapsed: a share root can fan out
+                // very wide, so we don't want to build/lay out thousands of
+                // rows up front.
+                let expansion = ExpansionState::new(true);
+                let flat = flatten_tree(&tree, &expansion);
+                self.selection = Selection::Folder {
+                    name,
+                    tree,
+                    expansion,
+                    flat,
+                };
             }
             SearchBy::User => {
-                let indices = self.identity_index.get(&name).cloned().unwrap_or_default();
-                let tree = build_path_tree(&self.records, &indices);
-                self.selection = Selection::User { name, tree };
+                let name = self.unique_identities[idx].clone();
+                let indices = self
+                    .identity_index
+                    .get(name.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let tree = build_path_tree(&self.records, indices);
+                // User view starts fully expanded so the whole access map
+                // is visible at a glance.
+                let expansion = ExpansionState::new(true);
+                let flat = flatten_tree(&tree, &expansion);
+                self.selection = Selection::User {
+                    name,
+                    tree,
+                    expansion,
+                    flat,
+                };
+            }
+            SearchBy::Other => {
+                let name = self.unique_others[idx].clone();
+                let indices = self
+                    .other_index
+                    .get(name.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                // A given sub-path can recur under several different folder
+                // roots, so use the full-path tree (like the user view) and
+                // start it collapsed, since that fan-out can be wide.
+                let tree = build_path_tree(&self.records, indices);
+                let expansion = ExpansionState::new(true);
+                let flat = flatten_tree(&tree, &expansion);
+                self.selection = Selection::Other {
+                    name,
+                    tree,
+                    expansion,
+                    flat,
+                };
             }
         }
     }
@@ -209,6 +311,15 @@ impl FolderAclApp {
                         self.sidebar_query.clear();
                         self.refresh_sidebar_cache();
                     }
+                    if ui
+                        .selectable_label(self.search_by == SearchBy::Other, "🗂 Other")
+                        .clicked()
+                        && self.search_by != SearchBy::Other
+                    {
+                        self.search_by = SearchBy::Other;
+                        self.sidebar_query.clear();
+                        self.refresh_sidebar_cache();
+                    }
                 });
                 ui.add_space(4.0);
                 let edit = ui.add(
@@ -216,6 +327,7 @@ impl FolderAclApp {
                         .hint_text(match self.search_by {
                             SearchBy::Folder => "🔍 Search folders...",
                             SearchBy::User => "🔍 Search users...",
+                            SearchBy::Other => "🔍 Search other paths...",
                         })
                         .desired_width(f32::INFINITY),
                 );
@@ -232,12 +344,19 @@ impl FolderAclApp {
                 let icon = match self.search_by {
                     SearchBy::Folder => "📁",
                     SearchBy::User => "👤",
+                    SearchBy::Other => "🗂",
                 };
-                let mut clicked_item: Option<String> = None;
+                let names: &[String] = match self.search_by {
+                    SearchBy::Folder => &self.unique_folders,
+                    SearchBy::User => &self.unique_identities,
+                    SearchBy::Other => &self.unique_others,
+                };
+                let mut clicked_idx: Option<usize> = None;
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for item in &self.sidebar_cache {
+                        for &idx in &self.sidebar_cache {
+                            let item = &names[idx];
                             let selected = match &self.selection {
                                 Selection::Folder { name, .. } => {
                                     self.search_by == SearchBy::Folder && name == item
@@ -245,18 +364,21 @@ impl FolderAclApp {
                                 Selection::User { name, .. } => {
                                     self.search_by == SearchBy::User && name == item
                                 }
+                                Selection::Other { name, .. } => {
+                                    self.search_by == SearchBy::Other && name == item
+                                }
                                 Selection::None => false,
                             };
                             if ui
                                 .selectable_label(selected, format!("{icon} {item}"))
                                 .clicked()
                             {
-                                clicked_item = Some(item.clone());
+                                clicked_idx = Some(idx);
                             }
                         }
                     });
-                if let Some(item) = clicked_item {
-                    self.select(item);
+                if let Some(idx) = clicked_idx {
+                    self.select_index(idx);
                 }
             });
     }
@@ -271,6 +393,7 @@ impl FolderAclApp {
             }
 
             let mut clear_selection = false;
+            let mut toggle_id: Option<String> = None;
 
             match &self.selection {
                 Selection::None => {
@@ -282,16 +405,29 @@ impl FolderAclApp {
                         &mut self.table_sort_desc,
                     );
                 }
-                Selection::Folder { name, tree } => {
-                    draw_tree_view(ui, &self.records, "📁", name, tree, false, &mut clear_selection);
+                Selection::Folder { name, flat, .. } => {
+                    draw_tree_view(ui, &self.records, "📁", name, flat, &mut clear_selection, &mut toggle_id);
                 }
-                Selection::User { name, tree } => {
-                    draw_tree_view(ui, &self.records, "👤", name, tree, true, &mut clear_selection);
+                Selection::User { name, flat, .. } => {
+                    draw_tree_view(ui, &self.records, "👤", name, flat, &mut clear_selection, &mut toggle_id);
+                }
+                Selection::Other { name, flat, .. } => {
+                    draw_tree_view(ui, &self.records, "🗂", name, flat, &mut clear_selection, &mut toggle_id);
                 }
             }
 
             if clear_selection {
                 self.selection = Selection::None;
+            } else if let Some(id) = toggle_id {
+                match &mut self.selection {
+                    Selection::Folder { tree, expansion, flat, .. }
+                    | Selection::User { tree, expansion, flat, .. }
+                    | Selection::Other { tree, expansion, flat, .. } => {
+                        expansion.toggle(id);
+                        *flat = flatten_tree(tree, expansion);
+                    }
+                    Selection::None => {}
+                }
             }
         });
     }
@@ -353,21 +489,29 @@ fn draw_table(
             *sort_desc = false;
         }
         let (sc, sd) = (*sort_col, *sort_desc);
-        filtered.sort_by(|&a, &b| {
+        // sort_unstable_by: we don't need stability and it's noticeably
+        // faster on large (million-row) inputs.
+        filtered.sort_unstable_by(|&a, &b| {
             let ord = records[a].field(sc).cmp(records[b].field(sc));
             if sd { ord.reverse() } else { ord }
         });
     }
 }
 
+/// Renders a permissions tree from its precomputed flat row list. Only rows
+/// actually visible in the scroll viewport are turned into widgets each
+/// frame (`ScrollArea::show_rows`), which is what keeps this smooth even
+/// when a user/folder has thousands of matching rows — a naive recursive
+/// `CollapsingHeader` tree has to re-lay-out every open node every single
+/// frame, which is what caused the lag.
 fn draw_tree_view(
     ui: &mut egui::Ui,
     records: &[Record],
     icon: &str,
     name: &str,
-    tree: &TreeNode,
-    show_identity: bool,
+    flat: &[FlatRow],
     clear_selection: &mut bool,
+    toggle_id: &mut Option<String>,
 ) {
     ui.horizontal(|ui| {
         ui.heading(format!("{icon} {name}"));
@@ -375,57 +519,54 @@ fn draw_tree_view(
             *clear_selection = true;
         }
     });
+    ui.label(egui::RichText::new(format!("{} rows", flat.len())).weak());
     ui.add_space(4.0);
+
+    const ROW_HEIGHT: f32 = 22.0;
+    const INDENT: f32 = 18.0;
 
     egui::ScrollArea::vertical()
         .id_salt(format!("tree-{icon}-{name}"))
         .auto_shrink([false, false])
-        .show(ui, |ui| {
-            render_entries(ui, records, &tree.entries, show_identity);
-            for (child_name, child) in &tree.children {
-                render_node(
-                    ui,
-                    records,
-                    child_name,
-                    child,
-                    show_identity,
-                    &format!("{icon}{name}"),
-                );
+        .show_rows(ui, ROW_HEIGHT, flat.len(), |ui, range| {
+            for i in range {
+                match &flat[i] {
+                    FlatRow::Folder {
+                        id,
+                        name,
+                        depth,
+                        expanded,
+                        has_children,
+                    } => {
+                        ui.horizontal(|ui| {
+                            ui.add_space(*depth as f32 * INDENT);
+                            let arrow = if !*has_children {
+                                "  "
+                            } else if *expanded {
+                                "▼"
+                            } else {
+                                "▶"
+                            };
+                            if ui.button(format!("{arrow} 📂 {name}")).clicked() {
+                                *toggle_id = Some(id.clone());
+                            }
+                        });
+                    }
+                    FlatRow::Entry { record_idx, depth } => {
+                        let r = &records[*record_idx];
+                        ui.horizontal(|ui| {
+                            ui.add_space(*depth as f32 * INDENT + INDENT);
+                            ui.label("🔑");
+                            ui.label(egui::RichText::new(r.identity.as_ref()).strong());
+                            ui.label(
+                                egui::RichText::new(r.rights.as_ref())
+                                    .color(egui::Color32::from_rgb(140, 200, 255)),
+                            );
+                            ui.label(egui::RichText::new(r.access_control.as_ref()).weak());
+                            ui.label(egui::RichText::new(r.inherited.as_ref()).italics());
+                        });
+                    }
+                }
             }
         });
-}
-
-fn render_node(
-    ui: &mut egui::Ui,
-    records: &[Record],
-    name: &str,
-    node: &TreeNode,
-    show_identity: bool,
-    id_prefix: &str,
-) {
-    let id = format!("{id_prefix}/{name}");
-    egui::CollapsingHeader::new(format!("📂 {name}"))
-        .id_salt(id.clone())
-        .default_open(false)
-        .show(ui, |ui| {
-            render_entries(ui, records, &node.entries, show_identity);
-            for (child_name, child) in &node.children {
-                render_node(ui, records, child_name, child, show_identity, &id);
-            }
-        });
-}
-
-fn render_entries(ui: &mut egui::Ui, records: &[Record], entries: &[usize], show_identity: bool) {
-    for &idx in entries {
-        let r = &records[idx];
-        ui.horizontal(|ui| {
-            ui.label("🔑");
-            if show_identity {
-                ui.label(egui::RichText::new(&r.identity).strong());
-            }
-            ui.label(egui::RichText::new(&r.rights).color(egui::Color32::from_rgb(140, 200, 255)));
-            ui.label(egui::RichText::new(&r.access_control).weak());
-            ui.label(egui::RichText::new(&r.inherited).italics());
-        });
-    }
 }
