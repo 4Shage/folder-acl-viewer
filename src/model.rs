@@ -56,7 +56,7 @@ pub fn split_folder(path: &str) -> (&str, &str) {
     for (i, c) in path.char_indices() {
         if c == '\\' {
             count += 1;
-            if count == 4 {
+            if count == 6 {
                 return (&path[..=i], &path[i + 1..]);
             }
         }
