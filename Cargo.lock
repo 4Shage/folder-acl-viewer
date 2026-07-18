@@ -825,6 +825,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "egui_glow",
+ "glow",
  "glutin",
  "glutin-winit",
  "image",
@@ -1129,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "folder-acl-viewer"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "csv",
  "eframe",

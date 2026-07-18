@@ -1,8 +1,3 @@
-#![cfg_attr(
-    all(target_os = "windows", not(debug_assertions)),
-    windows_subsystem = "windows"
-)]
-
 mod app;
 mod loader;
 mod model;
@@ -21,6 +16,7 @@ fn main() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1150.0, 680.0]),
+        renderer: eframe::Renderer::Glow,
         ..Default::default()
     };
 

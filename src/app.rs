@@ -178,10 +178,9 @@ impl FolderAclApp {
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
                 let tree = build_other_tree(&self.records, indices);
-                // Folder view starts collapsed: a share root can fan out
-                // very wide, so we don't want to build/lay out thousands of
-                // rows up front.
-                let expansion = ExpansionState::new(false);
+                // Unfolded by default — virtualized rendering means the
+                // number of expanded rows doesn't affect performance.
+                let expansion = ExpansionState::new(true);
                 let flat = flatten_tree(&tree, &expansion);
                 self.selection = Selection::Folder {
                     name,
@@ -198,8 +197,6 @@ impl FolderAclApp {
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
                 let tree = build_path_tree(&self.records, indices);
-                // User view starts fully expanded so the whole access map
-                // is visible at a glance.
                 let expansion = ExpansionState::new(true);
                 let flat = flatten_tree(&tree, &expansion);
                 self.selection = Selection::User {
@@ -217,10 +214,9 @@ impl FolderAclApp {
                     .map(Vec::as_slice)
                     .unwrap_or(&[]);
                 // A given sub-path can recur under several different folder
-                // roots, so use the full-path tree (like the user view) and
-                // start it collapsed, since that fan-out can be wide.
+                // roots, so use the full-path tree (like the user view).
                 let tree = build_path_tree(&self.records, indices);
-                let expansion = ExpansionState::new(false);
+                let expansion = ExpansionState::new(true);
                 let flat = flatten_tree(&tree, &expansion);
                 self.selection = Selection::Other {
                     name,
@@ -408,13 +404,18 @@ impl FolderAclApp {
                     );
                 }
                 Selection::Folder { name, flat, .. } => {
-                    draw_tree_view(ui, &self.records, "📁", name, flat, &mut clear_selection, &mut toggle_id);
+                    // Tree ids are subfolder segments; the folder root
+                    // itself (already a full path ending in `\`) is the
+                    // prefix for reconstructing each node's copyable path.
+                    draw_tree_view(ui, &self.records, "📁", name, flat, name, true, &mut clear_selection, &mut toggle_id);
                 }
                 Selection::User { name, flat, .. } => {
-                    draw_tree_view(ui, &self.records, "👤", name, flat, &mut clear_selection, &mut toggle_id);
+                    // Tree ids here are already full UNC paths minus the
+                    // leading `\\`.
+                    draw_tree_view(ui, &self.records, "👤", name, flat, "\\\\", false, &mut clear_selection, &mut toggle_id);
                 }
                 Selection::Other { name, flat, .. } => {
-                    draw_tree_view(ui, &self.records, "🗂", name, flat, &mut clear_selection, &mut toggle_id);
+                    draw_tree_view(ui, &self.records, "🗂", name, flat, "\\\\", false, &mut clear_selection, &mut toggle_id);
                 }
             }
 
@@ -506,17 +507,34 @@ fn draw_table(
 /// when a user/folder has thousands of matching rows — a naive recursive
 /// `CollapsingHeader` tree has to re-lay-out every open node every single
 /// frame, which is what caused the lag.
+/// Renders a permissions tree from its precomputed flat row list. Only rows
+/// actually visible in the scroll viewport are turned into widgets each
+/// frame (`ScrollArea::show_rows`), which is what keeps this smooth even
+/// when a user/folder has thousands of matching rows — a naive recursive
+/// `CollapsingHeader` tree has to re-lay-out every open node every single
+/// frame, which is what caused the lag.
+///
+/// `path_prefix` + a folder row's `id` reconstructs that folder's real
+/// filesystem path for the copy button. `show_root_copy` adds the same
+/// button next to the heading, for selections where the heading itself is
+/// a real folder path (i.e. the Folder tab, not User/Other).
 fn draw_tree_view(
     ui: &mut egui::Ui,
     records: &[Record],
     icon: &str,
     name: &str,
     flat: &[FlatRow],
+    path_prefix: &str,
+    show_root_copy: bool,
     clear_selection: &mut bool,
     toggle_id: &mut Option<String>,
 ) {
     ui.horizontal(|ui| {
         ui.heading(format!("{icon} {name}"));
+        if show_root_copy && copy_button(ui, "Copy folder path").clicked() {
+            copy_to_clipboard(ui, name);
+        }
+        ui.add_space(8.0);
         if ui.button("✕ Clear").clicked() {
             *clear_selection = true;
         }
@@ -524,7 +542,7 @@ fn draw_tree_view(
     ui.label(egui::RichText::new(format!("{} rows", flat.len())).weak());
     ui.add_space(4.0);
 
-    const ROW_HEIGHT: f32 = 22.0;
+    const ROW_HEIGHT: f32 = 24.0;
     const INDENT: f32 = 18.0;
 
     egui::ScrollArea::vertical()
@@ -532,43 +550,82 @@ fn draw_tree_view(
         .auto_shrink([false, false])
         .show_rows(ui, ROW_HEIGHT, flat.len(), |ui, range| {
             for i in range {
-                match &flat[i] {
-                    FlatRow::Folder {
-                        id,
-                        name,
-                        depth,
-                        expanded,
-                        has_children,
-                    } => {
-                        ui.horizontal(|ui| {
-                            ui.add_space(*depth as f32 * INDENT);
-                            let arrow = if !*has_children {
-                                "  "
-                            } else if *expanded {
-                                "▼"
-                            } else {
-                                "▶"
-                            };
-                            if ui.button(format!("{arrow} 📂 {name}")).clicked() {
-                                *toggle_id = Some(id.clone());
-                            }
-                        });
-                    }
-                    FlatRow::Entry { record_idx, depth } => {
-                        let r = &records[*record_idx];
-                        ui.horizontal(|ui| {
-                            ui.add_space(*depth as f32 * INDENT + INDENT);
-                            ui.label("🔑");
-                            ui.label(egui::RichText::new(r.identity.as_ref()).strong());
-                            ui.label(
-                                egui::RichText::new(r.rights.as_ref())
-                                    .color(egui::Color32::from_rgb(140, 200, 255)),
-                            );
-                            ui.label(egui::RichText::new(r.access_control.as_ref()).weak());
-                            ui.label(egui::RichText::new(r.inherited.as_ref()).italics());
-                        });
-                    }
-                }
+                let bg = if i % 2 == 0 {
+                    ui.visuals().faint_bg_color
+                } else {
+                    egui::Color32::TRANSPARENT
+                };
+                egui::Frame::default()
+                    .fill(bg)
+                    .inner_margin(egui::Margin::symmetric(4, 2))
+                    .corner_radius(egui::CornerRadius::same(4))
+                    .show(ui, |ui| match &flat[i] {
+                        FlatRow::Folder {
+                            id,
+                            name,
+                            depth,
+                            expanded,
+                            has_children,
+                        } => {
+                            ui.horizontal(|ui| {
+                                ui.add_space(*depth as f32 * INDENT);
+                                let arrow = if !*has_children {
+                                    "  "
+                                } else if *expanded {
+                                    "▼"
+                                } else {
+                                    "▶"
+                                };
+                                if ui.button(format!("{arrow} 📂 {name}")).clicked() {
+                                    *toggle_id = Some(id.clone());
+                                }
+                                if copy_button(ui, "Copy path").clicked() {
+                                    copy_to_clipboard(ui, &format!("{path_prefix}{id}"));
+                                }
+                            });
+                        }
+                        FlatRow::Entry { record_idx, depth } => {
+                            let r = &records[*record_idx];
+                            ui.horizontal(|ui| {
+                                ui.add_space(*depth as f32 * INDENT + INDENT);
+                                ui.label("🔑");
+                                ui.label(egui::RichText::new(r.identity.as_ref()).strong());
+                                chip(ui, r.rights.as_ref(), egui::Color32::from_rgb(45, 90, 135));
+                                chip(
+                                    ui,
+                                    r.access_control.as_ref(),
+                                    egui::Color32::from_rgb(70, 70, 82),
+                                );
+                                ui.label(
+                                    egui::RichText::new(r.inherited.as_ref()).italics().weak(),
+                                );
+                            });
+                        }
+                    });
             }
+        });
+}
+
+fn copy_button(ui: &mut egui::Ui, tooltip: &str) -> egui::Response {
+    ui.small_button("📋").on_hover_text(tooltip)
+}
+
+fn copy_to_clipboard(ui: &egui::Ui, text: &str) {
+    ui.ctx().copy_text(text.to_string());
+}
+
+/// Small rounded, colored badge — used for Rights/AccessControl so they
+/// read as tags rather than blending into the rest of the row's text.
+fn chip(ui: &mut egui::Ui, text: &str, color: egui::Color32) {
+    egui::Frame::default()
+        .fill(color)
+        .corner_radius(egui::CornerRadius::same(4))
+        .inner_margin(egui::Margin::symmetric(6, 1))
+        .show(ui, |ui| {
+            ui.label(
+                egui::RichText::new(text)
+                    .color(egui::Color32::WHITE)
+                    .small(),
+            );
         });
 }

@@ -56,7 +56,7 @@ pub fn split_folder(path: &str) -> (&str, &str) {
     for (i, c) in path.char_indices() {
         if c == '\\' {
             count += 1;
-            if count == 6 {
+            if count == 4 {
                 return (&path[..=i], &path[i + 1..]);
             }
         }
@@ -181,7 +181,7 @@ fn flatten_node(
         let id = if id_prefix.is_empty() {
             name.clone()
         } else {
-            format!("{id_prefix}/{name}")
+            format!("{id_prefix}\\{name}")
         };
         let expanded = expansion.is_open(&id);
         let has_children = !child.children.is_empty() || !child.entries.is_empty();
