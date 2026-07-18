@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19,13 +19,18 @@ pub struct LoadedData {
 
 /// Reads the file asynchronously, then parses and indexes it (CPU-bound) on
 /// a blocking thread so the UI/async runtime never stalls, even for
-/// multi-million-row files.
-pub async fn load_records(path: PathBuf) -> Result<LoadedData, String> {
+/// multi-million-row files. Rows whose Identity exactly matches an entry in
+/// `excluded_identities` are dropped entirely (e.g. noisy built-in
+/// principals like `BUILTIN\Administrators`).
+pub async fn load_records(
+    path: PathBuf,
+    excluded_identities: HashSet<String>,
+) -> Result<LoadedData, String> {
     let content = tokio::fs::read(&path)
         .await
         .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
 
-    tokio::task::spawn_blocking(move || parse_and_index(&content))
+    tokio::task::spawn_blocking(move || parse_and_index(&content, &excluded_identities))
         .await
         .map_err(|e| format!("Parsing task panicked: {e}"))?
 }
@@ -55,7 +60,10 @@ impl Interner {
     }
 }
 
-fn parse_and_index(content: &[u8]) -> Result<LoadedData, String> {
+fn parse_and_index(
+    content: &[u8],
+    excluded_identities: &HashSet<String>,
+) -> Result<LoadedData, String> {
     // Rough capacity hint from newline count, so the record Vec doesn't
     // have to repeatedly reallocate/copy while growing to millions of rows.
     let approx_rows = content.iter().filter(|&&b| b == b'\n').count().max(16);
@@ -74,16 +82,11 @@ fn parse_and_index(content: &[u8]) -> Result<LoadedData, String> {
     for result in reader.records() {
         let row = result.map_err(|e| format!("CSV parse error: {e}"))?;
         let raw_folder = row.get(0).unwrap_or("").trim();
-        let identity = interner.intern(row.get(1).unwrap_or("").trim());
-        if vec![
-            "BUILTIN\\Administrators",
-            "CREATOR OWNER",
-            "NT AUTHORITY\\SYSTEM",
-        ]
-        .contains(&&*identity)
-        {
+        let identity_raw = row.get(1).unwrap_or("").trim();
+        if excluded_identities.contains(identity_raw) {
             continue;
         }
+        let identity = interner.intern(identity_raw);
         let rights = interner.intern(row.get(2).unwrap_or("").trim());
         let access_control = interner.intern(row.get(3).unwrap_or("").trim());
         let inherited = interner.intern(row.get(4).unwrap_or("").trim());

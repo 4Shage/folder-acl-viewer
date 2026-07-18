@@ -73,6 +73,11 @@ pub struct FolderAclApp {
     error: Option<String>,
     loading: bool,
 
+    // Newline-separated identities to drop entirely when loading a CSV
+    // (e.g. noisy built-in principals). Edited via the "⚙ Filters" popup.
+    exclude_input: String,
+    show_filter_settings: bool,
+
     rt: Handle,
     result_tx: Sender<Result<(PathBuf, LoadedData), String>>,
     result_rx: Receiver<Result<(PathBuf, LoadedData), String>>,
@@ -102,18 +107,33 @@ impl FolderAclApp {
             loaded_path: None,
             error: None,
             loading: false,
+            exclude_input: "BUILTIN\\Administrators\nCREATOR OWNER\nNT AUTHORITY\\SYSTEM"
+                .to_string(),
+            show_filter_settings: false,
             rt,
             result_tx,
             result_rx,
         }
     }
 
+    /// Identities currently listed in the filter box, one per line, blanks
+    /// dropped.
+    fn parsed_exclusions(&self) -> std::collections::HashSet<String> {
+        self.exclude_input
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
     pub fn request_load(&mut self, path: PathBuf) {
         self.loading = true;
         self.error = None;
+        let excluded = self.parsed_exclusions();
         let tx = self.result_tx.clone();
         self.rt.spawn(async move {
-            let res = loader::load_records(path.clone()).await;
+            let res = loader::load_records(path.clone(), excluded).await;
             let _ = tx.send(res.map(|data| (path, data)));
         });
     }
@@ -263,6 +283,9 @@ impl FolderAclApp {
                         self.request_load(path);
                     }
                 }
+                if ui.button("⚙ Filters").clicked() {
+                    self.show_filter_settings = !self.show_filter_settings;
+                }
                 if self.loading {
                     ui.add(egui::Spinner::new());
                     ui.label("Loading...");
@@ -280,6 +303,41 @@ impl FolderAclApp {
             }
             ui.add_space(6.0);
         });
+
+        let mut show = self.show_filter_settings;
+        egui::Window::new("⚙ Filter identities")
+            .open(&mut show)
+            .resizable(true)
+            .default_width(360.0)
+            .show(ui.ctx(), |ui| {
+                ui.label(
+                    egui::RichText::new("Identities to drop entirely on load, one per line:")
+                        .weak(),
+                );
+                ui.add_space(4.0);
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.exclude_input)
+                        .desired_rows(8)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("BUILTIN\\Administrators\nCREATOR OWNER\nNT AUTHORITY\\SYSTEM"),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("{} entries", self.parsed_exclusions().len()))
+                            .weak(),
+                    );
+                    if ui.button("Clear list").clicked() {
+                        self.exclude_input.clear();
+                    }
+                });
+                ui.label(
+                    egui::RichText::new("Applies the next time you open a CSV.")
+                        .weak()
+                        .italics(),
+                );
+            });
+        self.show_filter_settings = show;
     }
 
     fn sidebar_panel(&mut self, ui: &mut egui::Ui) {
