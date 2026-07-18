@@ -76,6 +76,9 @@ pub struct FolderAclApp {
     // Newline-separated identities to drop entirely when loading a CSV
     // (e.g. noisy built-in principals). Edited via the "⚙ Filters" popup.
     exclude_input: String,
+    // How many leading backslashes go into the Folder column before the
+    // rest falls into Other. Also edited via the "⚙ Filters" popup.
+    split_depth: usize,
     show_filter_settings: bool,
 
     rt: Handle,
@@ -109,6 +112,7 @@ impl FolderAclApp {
             loading: false,
             exclude_input: "BUILTIN\\Administrators\nCREATOR OWNER\nNT AUTHORITY\\SYSTEM"
                 .to_string(),
+            split_depth: 4,
             show_filter_settings: false,
             rt,
             result_tx,
@@ -131,9 +135,10 @@ impl FolderAclApp {
         self.loading = true;
         self.error = None;
         let excluded = self.parsed_exclusions();
+        let split_depth = self.split_depth;
         let tx = self.result_tx.clone();
         self.rt.spawn(async move {
-            let res = loader::load_records(path.clone(), excluded).await;
+            let res = loader::load_records(path.clone(), excluded, split_depth).await;
             let _ = tx.send(res.map(|data| (path, data)));
         });
     }
@@ -305,11 +310,32 @@ impl FolderAclApp {
         });
 
         let mut show = self.show_filter_settings;
-        egui::Window::new("⚙ Filter identities")
+        egui::Window::new("⚙ Load Options")
             .open(&mut show)
             .resizable(true)
             .default_width(360.0)
             .show(ui.ctx(), |ui| {
+                ui.label(
+                    egui::RichText::new("Split Folder path after this many backslashes:").weak(),
+                );
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let mut depth = self.split_depth as i64;
+                    if ui
+                        .add(egui::DragValue::new(&mut depth).range(1..=20))
+                        .changed()
+                    {
+                        self.split_depth = depth.max(1) as usize;
+                    }
+                    ui.label(
+                        egui::RichText::new("e.g. 4 → \\\\server\\share\\dept\\  |  rest → Other")
+                            .weak(),
+                    );
+                });
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+
                 ui.label(
                     egui::RichText::new("Identities to drop entirely on load, one per line:")
                         .weak(),

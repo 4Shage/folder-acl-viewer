@@ -21,18 +21,23 @@ pub struct LoadedData {
 /// a blocking thread so the UI/async runtime never stalls, even for
 /// multi-million-row files. Rows whose Identity exactly matches an entry in
 /// `excluded_identities` are dropped entirely (e.g. noisy built-in
-/// principals like `BUILTIN\Administrators`).
+/// principals like `BUILTIN\Administrators`). `split_depth` controls how
+/// many leading backslashes go into the Folder column before the rest
+/// falls into Other.
 pub async fn load_records(
     path: PathBuf,
     excluded_identities: HashSet<String>,
+    split_depth: usize,
 ) -> Result<LoadedData, String> {
     let content = tokio::fs::read(&path)
         .await
         .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
 
-    tokio::task::spawn_blocking(move || parse_and_index(&content, &excluded_identities))
-        .await
-        .map_err(|e| format!("Parsing task panicked: {e}"))?
+    tokio::task::spawn_blocking(move || {
+        parse_and_index(&content, &excluded_identities, split_depth)
+    })
+    .await
+    .map_err(|e| format!("Parsing task panicked: {e}"))?
 }
 
 /// De-duplicates repeated field values into a single `Arc<str>` allocation.
@@ -63,6 +68,7 @@ impl Interner {
 fn parse_and_index(
     content: &[u8],
     excluded_identities: &HashSet<String>,
+    split_depth: usize,
 ) -> Result<LoadedData, String> {
     // Rough capacity hint from newline count, so the record Vec doesn't
     // have to repeatedly reallocate/copy while growing to millions of rows.
@@ -90,7 +96,7 @@ fn parse_and_index(
         let rights = interner.intern(row.get(2).unwrap_or("").trim());
         let access_control = interner.intern(row.get(3).unwrap_or("").trim());
         let inherited = interner.intern(row.get(4).unwrap_or("").trim());
-        let (folder_raw, other_raw) = split_folder(raw_folder);
+        let (folder_raw, other_raw) = split_folder(raw_folder, split_depth);
         let folder = interner.intern(folder_raw);
         let other = interner.intern(other_raw);
         records.push(Record {

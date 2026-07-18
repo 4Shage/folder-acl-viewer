@@ -44,19 +44,22 @@ impl Record {
     }
 }
 
-/// Splits `path` right after the 4th backslash. Everything up to and
-/// including the 4th `\` becomes `folder`, the remainder becomes `other`.
-/// If there are fewer than 4 backslashes, `folder` is the whole string
+/// Splits `path` right after the `depth`-th backslash. Everything up to and
+/// including that `\` becomes `folder`, the remainder becomes `other`. If
+/// there are fewer than `depth` backslashes, `folder` is the whole string
 /// and `other` is empty.
 ///
 /// Borrows from `path` instead of allocating, so the caller can decide
 /// whether/how to intern the pieces.
-pub fn split_folder(path: &str) -> (&str, &str) {
+pub fn split_folder(path: &str, depth: usize) -> (&str, &str) {
+    if depth == 0 {
+        return ("", path);
+    }
     let mut count = 0;
     for (i, c) in path.char_indices() {
         if c == '\\' {
             count += 1;
-            if count == 4 {
+            if count == depth {
                 return (&path[..=i], &path[i + 1..]);
             }
         }
