@@ -79,6 +79,10 @@ pub struct FolderAclApp {
     // How many leading backslashes go into the Folder column before the
     // rest falls into Other. Also edited via the "⚙ Filters" popup.
     split_depth: usize,
+    // When set, split_depth is only a floor — the split point is extended
+    // automatically so a Folder never ends up containing just one
+    // subfolder.
+    auto_split: bool,
     show_filter_settings: bool,
 
     rt: Handle,
@@ -113,6 +117,7 @@ impl FolderAclApp {
             exclude_input: "BUILTIN\\Administrators\nCREATOR OWNER\nNT AUTHORITY\\SYSTEM"
                 .to_string(),
             split_depth: 4,
+            auto_split: true,
             show_filter_settings: false,
             rt,
             result_tx,
@@ -136,9 +141,10 @@ impl FolderAclApp {
         self.error = None;
         let excluded = self.parsed_exclusions();
         let split_depth = self.split_depth;
+        let auto_split = self.auto_split;
         let tx = self.result_tx.clone();
         self.rt.spawn(async move {
-            let res = loader::load_records(path.clone(), excluded, split_depth).await;
+            let res = loader::load_records(path.clone(), excluded, split_depth, auto_split).await;
             let _ = tx.send(res.map(|data| (path, data)));
         });
     }
@@ -315,31 +321,29 @@ impl FolderAclApp {
             .resizable(true)
             .default_width(360.0)
             .show(ui.ctx(), |ui| {
-                ui.label(
-                    egui::RichText::new("Split Folder path after this many backslashes:").weak(),
-                );
+                ui.label(egui::RichText::new("Split Folder path after this many backslashes:").weak());
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     let mut depth = self.split_depth as i64;
-                    if ui
-                        .add(egui::DragValue::new(&mut depth).range(1..=20))
-                        .changed()
-                    {
+                    if ui.add(egui::DragValue::new(&mut depth).range(1..=20)).changed() {
                         self.split_depth = depth.max(1) as usize;
                     }
-                    ui.label(
-                        egui::RichText::new("e.g. 4 → \\\\server\\share\\dept\\  |  rest → Other")
-                            .weak(),
-                    );
+                    ui.label(egui::RichText::new("e.g. 4 → \\\\server\\share\\  |  rest → Other").weak());
                 });
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.auto_split, "Automatic — extend the split so a folder is never left with just one subfolder in it");
+                if self.auto_split {
+                    ui.label(
+                        egui::RichText::new("The number above becomes a minimum; splitting goes deeper wherever a folder only branches one way.")
+                            .weak()
+                            .italics(),
+                    );
+                }
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(6.0);
 
-                ui.label(
-                    egui::RichText::new("Identities to drop entirely on load, one per line:")
-                        .weak(),
-                );
+                ui.label(egui::RichText::new("Identities to drop entirely on load, one per line:").weak());
                 ui.add_space(4.0);
                 ui.add(
                     egui::TextEdit::multiline(&mut self.exclude_input)
@@ -349,19 +353,12 @@ impl FolderAclApp {
                 );
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{} entries", self.parsed_exclusions().len()))
-                            .weak(),
-                    );
+                    ui.label(egui::RichText::new(format!("{} entries", self.parsed_exclusions().len())).weak());
                     if ui.button("Clear list").clicked() {
                         self.exclude_input.clear();
                     }
                 });
-                ui.label(
-                    egui::RichText::new("Applies the next time you open a CSV.")
-                        .weak()
-                        .italics(),
-                );
+                ui.label(egui::RichText::new("Applies the next time you open a CSV.").weak().italics());
             });
         self.show_filter_settings = show;
     }
